@@ -4,11 +4,16 @@
 
 兩個分頁：
   1. 趨勢突破掃描：大盤環境 → 流動性 → Minervini 趨勢模板 → RS 相對強度 → ATR 停損與建議股數（只用價格，速度快）
-  2. 多因子選股：動能 + 品質 + 價值 + 成長綜合排名 → 換手緩衝 → 產業上限 → 反波動加權 → 大盤曝險
+  2. 多因子選股：動能 + 品質 + 價值 + 成長綜合排名 → 換手緩衝 → 產業/細產業上限 → 反波動加權 → 大盤曝險
+
+功能：
+  - 自行增加個股：併入股票池，並附「診斷」說明每檔為何入選或被排除
+  - 細產業上限（例如煉油、半導體）、下次財報日標示、可選擇不新買進財報在即的股票
+  - 上月持股與自選股可存進網址（加入書籤即可帶走），也可匯入/匯出 CSV
 
 使用方式：
-  - 放進現有 Streamlit 專案的 pages/ 資料夾（要和主程式同一層），側邊欄會多出「US Stock Screener」頁面
-  - 或單獨執行：streamlit run 1_US_Stock_Screener.py
+  - 放在專案根目錄當主程式（Streamlit Cloud 的 Main file path 填此檔名），或放進現有專案的 pages/ 資料夾
+  - 單獨執行：streamlit run 1_US_Stock_Screener.py
   - requirements.txt 需要：streamlit yfinance pandas numpy openpyxl lxml requests
 
 注意：資料來自 Yahoo Finance（免費、延遲、偶有缺漏、雲端環境可能被限流）；本程式是篩選工具，不是投資建議。
@@ -63,7 +68,7 @@ def load_index_universe(name):
 
 
 def parse_tickers(text):
-    raw = text.replace(",", " ").replace(";", " ").split()
+    raw = str(text or "").replace(",", " ").replace(";", " ").split()
     return sorted({t.strip().upper().replace(".", "-") for t in raw if t.strip()})
 
 
@@ -171,10 +176,95 @@ def build_tech(prices):
 
 
 # ============================================================
+# 財報日
+# ============================================================
+def _to_date(x):
+    try:
+        ts = pd.Timestamp(x)
+        if ts is pd.NaT:
+            return None
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert(None)
+        return ts.normalize()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def pick_next_earnings(cal, info=None):
+    # 從 yfinance 的 calendar / info 找「今天以後最近的一個財報日」，找不到回傳 None
+    today = pd.Timestamp.today().normalize()
+    cands = []
+    try:
+        if isinstance(cal, dict):
+            ed = cal.get("Earnings Date")
+            if ed is not None:
+                cands += list(ed) if isinstance(ed, (list, tuple)) else [ed]
+        elif cal is not None and not getattr(cal, "empty", True) and "Earnings Date" in cal.index:
+            cands += [v for v in cal.loc["Earnings Date"].tolist() if pd.notna(v)]
+    except Exception:  # noqa: BLE001
+        pass
+    if info:
+        for k in ("earningsTimestampStart", "earningsTimestamp"):
+            v = info.get(k)
+            if v:
+                try:
+                    cands.append(pd.to_datetime(v, unit="s"))
+                except Exception:  # noqa: BLE001
+                    pass
+    dates = sorted({d for d in (_to_date(c) for c in cands) if d is not None and d >= today})
+    return dates[0].strftime("%Y-%m-%d") if dates else None
+
+
+def add_earnings_cols(df, warn_days):
+    x = df.copy()
+    today = pd.Timestamp.today().normalize()
+    if "next_earnings" in x.columns:
+        d = pd.to_datetime(x["next_earnings"], errors="coerce")
+    else:
+        d = pd.Series(pd.NaT, index=x.index)
+        x["next_earnings"] = None
+    x["earn_days"] = (d - today).dt.days
+    soon = x["earn_days"].between(0, warn_days)
+    label = "⚠ " + x["earn_days"].astype("Int64").astype(str) + " 天內財報"
+    x["earn_flag"] = np.where(soon, label, "")
+    x["earn_soon"] = soon.fillna(False).astype(bool)
+    return x
+
+
+@st.cache_resource
+def _earn_store():
+    return {}
+
+
+def fetch_earnings_only(ticker):
+    try:
+        return pick_next_earnings(yf.Ticker(ticker).calendar)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def get_earnings(tickers, progress=None, max_age_h=24, workers=4):
+    store = _earn_store()
+    now = time.time()
+    todo = [t for t in tickers if t not in store or now - store[t][0] > max_age_h * 3600]
+    done = 0
+    if todo:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(fetch_earnings_only, t): t for t in todo}
+            for f in as_completed(futs):
+                store[futs[f]] = (time.time(), f.result())
+                done += 1
+                if progress is not None:
+                    progress.progress(done / len(todo), text=f"查詢財報日 {done}/{len(todo)}")
+    return pd.Series({t: store[t][1] for t in tickers if t in store}, dtype=object).reindex(tickers)
+
+
+# ============================================================
 # 基本面（含 Piotroski F-Score）
 # ============================================================
-FUND_COLS = ["name", "sector", "market_cap", "roe", "gross_prof", "debt_eq", "fscore",
-             "earn_yield", "fwd_ey", "fcf_yield", "rev_g", "eps_g", "eps_ttm"]
+FUND_COLS = ["name", "sector", "industry", "market_cap", "roe", "gross_prof", "debt_eq", "fscore",
+             "earn_yield", "fwd_ey", "fcf_yield", "rev_g", "eps_g", "eps_ttm", "next_earnings"]
+TEXT_COLS = ("name", "sector", "industry", "next_earnings")
 
 
 def _row(df, names, col):
@@ -254,12 +344,16 @@ def fetch_fundamentals(ticker):
     else:
         earn_yield = None
     out.update(
-        name=info.get("shortName"), sector=info.get("sector"), market_cap=mcap,
-        roe=info.get("returnOnEquity"), debt_eq=info.get("debtToEquity"), eps_ttm=eps,
+        name=info.get("shortName"), sector=info.get("sector"), industry=info.get("industry"),
+        market_cap=mcap, roe=info.get("returnOnEquity"), debt_eq=info.get("debtToEquity"), eps_ttm=eps,
         earn_yield=earn_yield, fwd_ey=(1 / fpe) if fpe and fpe > 0 else None,
         fcf_yield=(fcf / mcap) if fcf is not None and mcap else None,
         rev_g=info.get("revenueGrowth"), eps_g=info.get("earningsGrowth"),
     )
+    try:
+        out["next_earnings"] = pick_next_earnings(t.calendar, info)
+    except Exception:  # noqa: BLE001
+        out["next_earnings"] = pick_next_earnings(None, info)
     try:
         fin, bs, cf = t.financials, t.balance_sheet, t.cashflow
         out["gross_prof"] = _ratio(_row(fin, ["Gross Profit"], 0), _row(bs, ["Total Assets"], 0))
@@ -279,7 +373,8 @@ def _fund_store():
 def get_fundamentals(tickers, progress=None, max_age_h=24, workers=4):
     store = _fund_store()
     now = time.time()
-    todo = [t for t in tickers if t not in store or now - store[t][0] > max_age_h * 3600]
+    todo = [t for t in tickers
+            if t not in store or now - store[t][0] > max_age_h * 3600 or "industry" not in store[t][1]]
 
     def work(t):
         try:
@@ -303,7 +398,7 @@ def get_fundamentals(tickers, progress=None, max_age_h=24, workers=4):
     out = pd.DataFrame.from_dict(rows, orient="index") if rows else pd.DataFrame()
     out = out.reindex(index=tickers, columns=FUND_COLS)
     for c in FUND_COLS:
-        if c not in ("name", "sector"):
+        if c not in TEXT_COLS:
             out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
 
@@ -376,26 +471,46 @@ def inverse_vol_weights(vols, max_w):
 
 
 def build_portfolio(ranked, prev, p):
+    # 回傳 (入選清單, 賣出清單, 未入選原因 dict)
     rank_pos = {t: i + 1 for i, t in enumerate(ranked.index)}
-    chosen, sector_cnt = [], {}
+    chosen, sector_cnt, industry_cnt, notes = [], {}, {}, {}
+    prev_set = set(prev)
 
-    def can_add(t):
-        sec = ranked.at[t, "sector"]
-        return sec == "Unknown" or sector_cnt.get(sec, 0) < p.max_per_sector
+    def blocked(t):
+        sec, ind = ranked.at[t, "sector"], ranked.at[t, "industry"]
+        if sec != "Unknown" and sector_cnt.get(sec, 0) >= p.max_per_sector:
+            return f"同產業（{sec}）已滿 {p.max_per_sector} 檔"
+        if ind != "Unknown" and industry_cnt.get(ind, 0) >= p.max_per_industry:
+            return f"同細產業（{ind}）已滿 {p.max_per_industry} 檔"
+        return None
 
     def add(t):
         chosen.append(t)
-        sec = ranked.at[t, "sector"]
+        sec, ind = ranked.at[t, "sector"], ranked.at[t, "industry"]
         sector_cnt[sec] = sector_cnt.get(sec, 0) + 1
+        industry_cnt[ind] = industry_cnt.get(ind, 0) + 1
 
     keep = sorted([t for t in prev if t in rank_pos and rank_pos[t] <= p.keep_rank], key=rank_pos.get)
-    for t in keep:
-        if len(chosen) < p.n_hold and can_add(t):
-            add(t)
-    for t in ranked.index:
+    for t in keep:                                           # 1) 續抱
         if len(chosen) >= p.n_hold:
             break
-        if t not in chosen and can_add(t):
+        why = blocked(t)
+        if why:
+            notes[t] = why
+        else:
+            add(t)
+    for t in ranked.index:                                   # 2) 依排名補進
+        if len(chosen) >= p.n_hold:
+            break
+        if t in chosen:
+            continue
+        if p.skip_earnings and t not in prev_set and bool(ranked.at[t, "earn_soon"]):
+            notes[t] = f"財報在 {int(ranked.at[t, 'earn_days'])} 天內，暫不新買進"
+            continue
+        why = blocked(t)
+        if why:
+            notes[t] = why
+        else:
             add(t)
     sells = []
     for t in prev:
@@ -406,15 +521,26 @@ def build_portfolio(ranked, prev, p):
         elif rank_pos[t] > p.keep_rank:
             why = f"排名第 {rank_pos[t]}，跌出前 {p.keep_rank} 名"
         else:
-            why = "產業上限或名額限制"
+            why = notes.get(t, "名額限制")
         sells.append({"代號": t, "原因": why})
-    return chosen, pd.DataFrame(sells, columns=["代號", "原因"])
+    return chosen, pd.DataFrame(sells, columns=["代號", "原因"]), notes
 
 
 # ============================================================
 # 兩套選股流程
 # ============================================================
-def run_trend(prices, p):
+TREND_RULES = {
+    "收盤>150與200日線": lambda t: (t.close > t.sma150) & (t.close > t.sma200),
+    "150日線>200日線": lambda t: t.sma150 > t.sma200,
+    "200日線走升": lambda t: t.sma200 > t.sma200_prev,
+    "50日線>150與200日線": lambda t: (t.sma50 > t.sma150) & (t.sma50 > t.sma200),
+    "收盤>50日線": lambda t: t.close > t.sma50,
+    "高於52週低點30%以上": lambda t: t.close >= 1.30 * t.lo52,
+    "距52週高點25%內": lambda t: t.close >= 0.75 * t.hi52,
+}
+
+
+def run_trend(prices, p, progress=None):
     tech = build_tech(prices)
     if tech.empty:
         raise RuntimeError("沒有任何股票有足夠的價格資料。")
@@ -428,16 +554,13 @@ def run_trend(prices, p):
     raw = (0.4 * liquid["r12_1"].rank(pct=True) + 0.3 * liquid["r6"].rank(pct=True)
            + 0.3 * liquid["r3"].rank(pct=True))
     liquid["rs"] = (raw.rank(pct=True) * 98 + 1).round(0)
-    t = liquid
-    liquid["trend_ok"] = (
-        (t.close > t.sma150) & (t.close > t.sma200) & (t.sma150 > t.sma200)
-        & (t.sma200 > t.sma200_prev) & (t.sma50 > t.sma150) & (t.sma50 > t.sma200)
-        & (t.close > t.sma50) & (t.close >= 1.30 * t.lo52) & (t.close >= 0.75 * t.hi52)
-    )
+    for name, rule in TREND_RULES.items():
+        liquid[name] = rule(liquid)
+    liquid["trend_ok"] = liquid[list(TREND_RULES)].all(axis=1)
     funnel["通過趨勢模板（7 條件）"] = int(liquid["trend_ok"].sum())
-    cand = liquid[liquid["trend_ok"] & (liquid["rs"] >= p.min_rs)].sort_values("rs", ascending=False)
-    funnel[f"且 RS>={p.min_rs}"] = len(cand)
-    cand = cand.head(p.top).copy()
+    cand_all = liquid[liquid["trend_ok"] & (liquid["rs"] >= p.min_rs)].sort_values("rs", ascending=False)
+    funnel[f"且 RS>={p.min_rs}"] = len(cand_all)
+    cand = cand_all.head(p.top).copy()
 
     reg = regime(prices[BENCH])
     risk_pct = p.risk * reg["scale"]
@@ -458,7 +581,43 @@ def run_trend(prices, p):
         return "趨勢中，等回檔至50日線附近"
 
     cand["status"] = cand.apply(status, axis=1) if len(cand) else []
-    return {"cand": cand, "regime": reg, "funnel": funnel, "breadth": breadth,
+
+    # 財報日：候選股 + 自選股（通過流動性者）
+    extra_liq = [t for t in p.extra if t in liquid.index]
+    if p.check_earnings and (len(cand) or extra_liq):
+        ed = get_earnings(list(dict.fromkeys(list(cand.index) + extra_liq)), progress=progress)
+        cand["next_earnings"] = ed.reindex(cand.index)
+    else:
+        extra_liq_ed = None
+        ed = pd.Series(dtype=object)
+        cand["next_earnings"] = None
+    cand = add_earnings_cols(cand, p.warn_days)
+
+    # 自選股診斷
+    diag = []
+    for t in p.extra:
+        if t not in prices:
+            diag.append({"代號": t, "結果": "❌ 查無價格資料（代號可能有誤，或 Yahoo 沒有這檔）"})
+        elif t not in tech.index:
+            diag.append({"代號": t, "結果": "❌ 價格資料不足（上市未滿約 1 年）"})
+        elif t not in liquid.index:
+            diag.append({"代號": t, "結果": f"❌ 股價或成交額不足（收盤 {tech.at[t, 'close']:.2f}、日均成交額 {tech.at[t, 'dollar_vol'] / 1e6:.1f}M）"})
+        else:
+            row = liquid.loc[t]
+            failed = [n for n in TREND_RULES if not bool(row[n])]
+            if failed:
+                res = "❌ 未通過趨勢模板：" + "、".join(failed)
+            elif row["rs"] < p.min_rs:
+                res = f"➖ 通過趨勢模板，但 RS {row['rs']:.0f} 低於門檻 {p.min_rs}"
+            elif t in cand.index:
+                res = "✅ 入選候選清單"
+            else:
+                res = "✅ 符合條件，但超出「最多顯示檔數」"
+            ed_t = ed.get(t) if len(ed) else None
+            diag.append({"代號": t, "結果": res, "收盤價": round(float(row["close"]), 2),
+                         "RS評分": float(row["rs"]), "下次財報日": ed_t})
+    diag_df = pd.DataFrame(diag) if diag else pd.DataFrame(columns=["代號", "結果"])
+    return {"cand": cand, "regime": reg, "funnel": funnel, "breadth": breadth, "diag": diag_df,
             "charts": {t: prices[t]["Close"].iloc[-260:] for t in cand.index}}
 
 
@@ -467,10 +626,11 @@ def run_multifactor(prices, p, progress=None):
     if tech.empty:
         raise RuntimeError("沒有任何股票有足夠的價格資料。")
     funnel = {"股票池（成功下載）": len([t for t in prices if t != BENCH]), "資料足夠(>=253日)": len(tech)}
-    liquid = tech[(tech["close"] >= p.min_price) & (tech["dollar_vol"] >= p.min_dv)].copy()
-    funnel["通過股價與流動性"] = len(liquid)
+    liq1 = tech[(tech["close"] >= p.min_price) & (tech["dollar_vol"] >= p.min_dv)].copy()
+    funnel["通過股價與流動性"] = len(liq1)
+    liquid = liq1
     if p.trend_filter:
-        liquid = liquid[liquid["close"] > liquid["sma200"]].copy()
+        liquid = liq1[liq1["close"] > liq1["sma200"]].copy()
         funnel["收盤>200日線"] = len(liquid)
     if liquid.empty:
         raise RuntimeError("流動性與趨勢篩選後沒有任何股票（大盤可能很弱）。")
@@ -479,11 +639,16 @@ def run_multifactor(prices, p, progress=None):
     cut = liquid["mom"].quantile(1 - p.prefilter_top)
     pre = liquid[liquid["mom"] >= cut].sort_values("mom", ascending=False).head(p.max_fundamental)
     funnel[f"動能前{int(p.prefilter_top * 100)}%（抓基本面）"] = len(pre)
+    extra_in = [t for t in p.extra if t in liquid.index and t not in pre.index]
+    if extra_in:                                    # 自選股只要通過前面的濾網就一定評分
+        pre = pd.concat([pre, liquid.loc[extra_in]])
+        funnel["自選股另外加入評分"] = len(extra_in)
 
     fund = get_fundamentals(list(pre.index), progress=progress)
     funnel["基本面取得成功"] = int(fund[["sector", "roe", "earn_yield"]].notna().any(axis=1).sum())
     data = pre.join(fund)
     data["sector"] = data["sector"].fillna("Unknown")
+    data["industry"] = data["industry"].fillna("Unknown")
     if not p.allow_unprofitable:
         data = data[~(data["eps_ttm"].notna() & (data["eps_ttm"] <= 0))]
         funnel["排除近四季虧損"] = len(data)
@@ -494,8 +659,9 @@ def run_multifactor(prices, p, progress=None):
     funnel["可評分（資料足夠）"] = len(ranked)
     if ranked.empty:
         raise RuntimeError("沒有任何股票可評分（基本面資料可能抓取失敗或被 Yahoo 限流，請稍後再試）。")
+    ranked = add_earnings_cols(ranked, p.warn_days)
 
-    chosen, sells = build_portfolio(ranked, p.prev, p)
+    chosen, sells, notes = build_portfolio(ranked, p.prev, p)
     pf = ranked.loc[chosen].copy()
     reg = regime(prices[BENCH])
     w = inverse_vol_weights(pf["vol60"].fillna(pf["vol60"].median()), p.max_weight)
@@ -505,14 +671,45 @@ def run_multifactor(prices, p, progress=None):
     pf["stop"] = pf["close"] - p.atr_mult * pf["atr"]
     pf["stop_risk_pct"] = pf["shares"] * (pf["close"] - pf["stop"]) / p.equity * 100
     pf["action"] = ["續抱" if t in p.prev else "買進" for t in pf.index]
-    return {"pf": pf, "sells": sells, "ranked": ranked, "regime": reg, "funnel": funnel,
+
+    # 自選股診斷
+    rank_pos = {t: i + 1 for i, t in enumerate(ranked.index)}
+    diag = []
+    for t in p.extra:
+        if t not in prices:
+            r = "❌ 查無價格資料（代號可能有誤，或 Yahoo 沒有這檔）"
+        elif t not in tech.index:
+            r = "❌ 價格資料不足（上市未滿約 1 年）"
+        elif t not in liq1.index:
+            r = f"❌ 股價或成交額不足（收盤 {tech.at[t, 'close']:.2f}、日均成交額 {tech.at[t, 'dollar_vol'] / 1e6:.1f}M）"
+        elif t not in liquid.index:
+            r = "❌ 收盤在 200 日線之下（可取消「只考慮收盤 > 200 日線」）"
+        elif t not in data.index:
+            r = "❌ 近四季虧損，已排除（可勾選「允許近四季虧損」）"
+        elif t not in rank_pos:
+            r = "❌ 基本面資料不足，無法評分（可能被 Yahoo 限流，稍後再試）"
+        elif t in chosen:
+            r = f"✅ 入選持股（排名 {rank_pos[t]}）"
+        else:
+            r = f"➖ 排名第 {rank_pos[t]}，未入選（{notes.get(t, '名額已滿')}）"
+        row = {"代號": t, "結果": r}
+        if t in rank_pos:
+            rr = ranked.loc[t]
+            row.update({"綜合分": round(float(rr["composite"]), 1), "動能分": round(float(rr["mom"]), 1),
+                        "品質分": None if pd.isna(rr["quality"]) else round(float(rr["quality"]), 1),
+                        "價值分": None if pd.isna(rr["value"]) else round(float(rr["value"]), 1),
+                        "成長分": None if pd.isna(rr["growth"]) else round(float(rr["growth"]), 1),
+                        "下次財報日": rr["next_earnings"], "財報提醒": rr["earn_flag"]})
+        diag.append(row)
+    diag_df = pd.DataFrame(diag) if diag else pd.DataFrame(columns=["代號", "結果"])
+    return {"pf": pf, "sells": sells, "ranked": ranked, "regime": reg, "funnel": funnel, "diag": diag_df,
             "charts": {t: prices[t]["Close"].iloc[-260:] for t in pf.index}}
 
 
 # ============================================================
 # 顯示與匯出
 # ============================================================
-def fmt(df, mapping, pct_cols=(), ratio_cols=()):
+def fmt(df, mapping, pct_cols=()):
     x = df.copy()
     for c in pct_cols:
         if c in x:
@@ -532,10 +729,12 @@ def fmt(df, mapping, pct_cols=(), ratio_cols=()):
 TREND_MAP = {
     "close": "收盤價", "rs": "RS評分", "r12_1": "12-1月報酬%", "r6": "6月報酬%", "dist_high": "距52週高%",
     "ext50": "高於50日線%", "vol_ratio": "近5日量/50日均量", "atr": "ATR14", "stop": "建議停損價",
-    "shares": "建議股數", "position_value": "部位金額", "status": "狀態", "last_date": "資料日期",
+    "shares": "建議股數", "position_value": "部位金額", "status": "狀態",
+    "next_earnings": "下次財報日", "earn_flag": "財報提醒", "last_date": "資料日期",
 }
 MF_MAP = {
-    "name": "公司", "sector": "產業", "action": "動作", "rank": "排名", "composite": "綜合分",
+    "name": "公司", "sector": "產業", "industry": "細產業", "action": "動作", "earn_flag": "財報提醒",
+    "next_earnings": "下次財報日", "rank": "排名", "composite": "綜合分",
     "mom": "動能分", "quality": "品質分", "value": "價值分", "growth": "成長分", "close": "收盤價",
     "weight_pct": "建議權重%", "shares": "建議股數", "target_value": "建議金額", "stop": "建議停損價",
     "stop_risk_pct": "停損風險占資金%", "r12_1": "12-1月報酬%", "r6": "6月報酬%", "dist_high": "距52週高%",
@@ -579,22 +778,76 @@ def show_chart(charts, key):
     st.line_chart(pd.DataFrame({"收盤價": c, "50日線": c.rolling(50, min_periods=1).mean()}))
 
 
-def get_universe(uni, custom):
-    if uni == "自訂代號":
-        tks = parse_tickers(custom)
-        if not tks:
-            st.error("請在左側輸入至少一個代號。")
-            st.stop()
-        return tks
+def show_diag(diag):
+    if diag is None or diag.empty:
+        return
+    st.subheader("你加入的個股：診斷")
+    st.dataframe(diag.set_index("代號"))
+
+
+# ============================================================
+# 狀態保存（網址 / CSV）
+# ============================================================
+def _init_state():
+    # 第一次載入時，從網址參數還原「自選股」與「上月持股」
+    if "init_done" not in st.session_state:
+        st.session_state["init_done"] = True
+        qp = st.query_params
+        st.session_state["extra"] = qp.get("extra", "")
+        st.session_state["m_prev"] = qp.get("prev", "")
+
+
+def _set_param(key, tickers):
+    if tickers:
+        st.query_params[key] = ",".join(tickers)
+    elif key in st.query_params:
+        del st.query_params[key]
+
+
+def save_to_url():
+    _set_param("extra", parse_tickers(st.session_state.get("extra", "")))
+    _set_param("prev", parse_tickers(st.session_state.get("m_prev", "")))
+    st.session_state["flash"] = "已存到網址：請把這個網頁加入書籤，下次從書籤開啟就會自動帶回自選股與上月持股。"
+
+
+def adopt_holdings(tickers):
+    st.session_state["m_prev"] = ", ".join(tickers)
+    _set_param("prev", list(tickers))
+    st.session_state["flash"] = "已把本次建議持股設為「上月持股」（也已寫入網址，記得加入書籤）。"
+
+
+def import_holdings():
+    f = st.session_state.get("m_upload")
+    if f is None:
+        return
     try:
-        return load_index_universe("sp500" if uni == "S&P 500" else "sp1500")
+        df = pd.read_csv(f)
+        col = next((c for c in df.columns if str(c).strip().lower() in ("ticker", "代號", "symbol")), df.columns[0])
+        tks = parse_tickers(" ".join(map(str, df[col].dropna())))
+        st.session_state["m_prev"] = ", ".join(tks)
+        st.session_state["flash"] = f"已匯入 {len(tks)} 檔持股。"
     except Exception as e:  # noqa: BLE001
-        st.error(f"無法取得指數成分股名單（{e}）。可改用「自訂代號」。")
+        st.session_state["flash"] = f"匯入失敗：{e}"
+
+
+def get_universe(uni, custom, extra):
+    if uni == "自訂代號":
+        base = parse_tickers(custom)
+    else:
+        try:
+            base = load_index_universe("sp500" if uni == "S&P 500" else "sp1500")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"無法取得指數成分股名單（{e}）。可改用「自訂代號」。")
+            st.stop()
+    tickers = sorted(set(base) | set(extra))
+    if not tickers:
+        st.error("請在左側輸入至少一個代號。")
         st.stop()
+    return tickers
 
 
-def prepare_prices(uni, custom):
-    tickers = get_universe(uni, custom)
+def prepare_prices(uni, custom, extra):
+    tickers = get_universe(uni, custom, extra)
     bar = st.progress(0.0, text="準備下載價格…")
     prices = load_prices(sorted(set(tickers + [BENCH])), progress=bar)
     bar.empty()
@@ -607,6 +860,7 @@ def prepare_prices(uni, custom):
 # ============================================================
 # 介面
 # ============================================================
+_init_state()
 st.title("📈 美股選股")
 st.caption("資料來源：Yahoo Finance（免費、有延遲、偶有缺漏）。本工具為篩選與研究用途，不是投資建議。")
 
@@ -615,11 +869,21 @@ with st.sidebar:
     uni = st.selectbox("股票池", ["S&P 500", "S&P 1500", "自訂代號"], key="uni")
     custom = st.text_area("自訂代號（逗號或換行分隔）", "NVDA, AAPL, MSFT, AMZN, META, GOOGL, AVGO, LLY, COST, NFLX",
                           disabled=(uni != "自訂代號"), key="custom")
+    st.text_area("➕ 額外加入個股（自選股）", key="extra", placeholder="例如：TSLA, PLTR, SMCI",
+                 help="這些代號會併入股票池。通過股價/成交額與趨勢濾網的一定會被評分，結果下方的「診斷」會說明每檔為何入選或被排除。")
+    st.button("🔖 把自選股與上月持股存到網址", on_click=save_to_url, key="save_url",
+              help="存好後把網頁加入書籤，下次從書籤開啟就會自動帶回。")
+    if st.session_state.get("flash"):
+        st.success(st.session_state.pop("flash"))
+    st.divider()
     min_price = st.number_input("最低股價（美元）", min_value=1.0, value=10.0, step=1.0, key="min_price")
     min_dv_m = st.number_input("最低日均成交額（百萬美元）", min_value=0.0, value=20.0, step=5.0, key="min_dv")
     equity = st.number_input("總資金（美元）", min_value=1000, value=100000, step=10000, key="equity")
+    warn_days = st.number_input("財報警示天數", min_value=1, max_value=60, value=14, step=1, key="warn_days",
+                                help="下次財報日在這麼多天以內，表中會標示「⚠ N 天內財報」。")
     st.caption("首次執行會下載約 2 年日線，之後 6 小時內重跑會用快取。S&P 1500 較慢。")
 
+extra_list = parse_tickers(st.session_state.get("extra", ""))
 tab_trend, tab_mf = st.tabs(["🚀 趨勢突破掃描", "🧮 多因子選股（月度）"])
 
 # ---------------- 分頁 1：趨勢突破 ----------------
@@ -630,17 +894,22 @@ with tab_trend:
     atr_mult_t = c2.number_input("停損 = 收盤 − N × ATR", 1.0, 6.0, 2.5, 0.5, key="t_atr")
     risk_t = c3.number_input("單筆風險占總資金 %", 0.1, 5.0, 1.0, 0.1, key="t_risk") / 100
     max_pos_t = c4.number_input("單檔部位上限 %", 5.0, 100.0, 20.0, 5.0, key="t_maxpos") / 100
-    top_t = st.slider("最多顯示幾檔", 5, 100, 30, key="t_top")
+    c1, c2 = st.columns(2)
+    top_t = c1.slider("最多顯示幾檔", 5, 100, 30, key="t_top")
+    check_earn = c2.checkbox("查詢候選股的下次財報日", value=True, key="t_earn")
 
     if st.button("開始趨勢掃描", type="primary", key="run_trend"):
-        prices = prepare_prices(uni, custom)
+        prices = prepare_prices(uni, custom, extra_list)
         p = SimpleNamespace(min_price=min_price, min_dv=min_dv_m * 1e6, equity=equity, min_rs=min_rs,
-                            atr_mult=atr_mult_t, risk=risk_t, max_position=max_pos_t, top=top_t)
+                            atr_mult=atr_mult_t, risk=risk_t, max_position=max_pos_t, top=top_t,
+                            extra=extra_list, check_earnings=check_earn, warn_days=int(warn_days))
+        bar = st.progress(0.0, text="分析中…")
         try:
-            st.session_state["res_trend"] = run_trend(prices, p)
+            st.session_state["res_trend"] = run_trend(prices, p, progress=bar)
         except RuntimeError as e:
             st.session_state.pop("res_trend", None)
             st.error(str(e))
+        bar.empty()
 
     r = st.session_state.get("res_trend")
     if r:
@@ -655,10 +924,11 @@ with tab_trend:
                                file_name="us_trend_candidates.xlsx", key="dl_trend",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             show_chart(r["charts"], "chart_trend")
+        show_diag(r.get("diag"))
 
 # ---------------- 分頁 2：多因子 ----------------
 with tab_mf:
-    st.markdown("每月用 **動能、品質、價值、成長** 四個因子綜合排名，挑一籃子股票；有換手緩衝、產業上限、反波動加權與大盤曝險。")
+    st.markdown("每月用 **動能、品質、價值、成長** 四個因子綜合排名，挑一籃子股票；有換手緩衝、產業與細產業上限、反波動加權與大盤曝險。")
     c1, c2, c3, c4 = st.columns(4)
     w_mom = c1.slider("動能權重 %", 0, 100, 40, key="m_wm")
     w_q = c2.slider("品質權重 %", 0, 100, 25, key="m_wq")
@@ -668,29 +938,40 @@ with tab_mf:
     n_hold = c1.slider("持股檔數", 5, 30, 15, key="m_n")
     keep_rank = c2.slider("續抱排名門檻（前 N 名）", 10, 100, 30, key="m_keep")
     max_sec = c3.slider("同產業最多幾檔", 1, 10, 3, key="m_sec")
-    max_fund = c4.slider("最多抓幾檔基本面", 20, 250, 80, key="m_fund")
+    max_ind = c4.slider("同細產業最多幾檔", 1, 5, 2, key="m_ind",
+                        help="細產業例如「Oil & Gas Refining & Marketing」「Semiconductors」，可避免押在同一個題材。")
     c1, c2, c3, c4 = st.columns(4)
-    prefilter = c1.slider("動能前幾 % 才抓基本面", 20, 100, 50, key="m_pre")
-    atr_mult_m = c2.number_input("停損 = 收盤 − N × ATR", 1.0, 6.0, 3.0, 0.5, key="m_atr")
-    max_w = c3.number_input("單檔權重上限 %", 5.0, 50.0, 12.0, 1.0, key="m_maxw") / 100
-    sector_neutral = c4.checkbox("品質/價值/成長在同產業內比較", value=True, key="m_sn")
-    c1, c2 = st.columns(2)
-    trend_filter = c1.checkbox("只考慮收盤 > 200 日線", value=True, key="m_tf")
-    allow_unprof = c2.checkbox("允許近四季虧損的公司", value=False, key="m_up")
-    prev_text = st.text_area("上月持股（可選，逗號或換行分隔，用來計算續抱／賣出）", "", key="m_prev")
+    max_fund = c1.slider("最多抓幾檔基本面", 20, 250, 80, key="m_fund")
+    prefilter = c2.slider("動能前幾 % 才抓基本面", 20, 100, 50, key="m_pre")
+    atr_mult_m = c3.number_input("停損 = 收盤 − N × ATR", 1.0, 6.0, 3.0, 0.5, key="m_atr")
+    max_w = c4.number_input("單檔權重上限 %", 5.0, 50.0, 12.0, 1.0, key="m_maxw") / 100
+    c1, c2, c3, c4 = st.columns(4)
+    sector_neutral = c1.checkbox("品質/價值/成長在同產業內比較", value=True, key="m_sn")
+    trend_filter = c2.checkbox("只考慮收盤 > 200 日線", value=True, key="m_tf")
+    allow_unprof = c3.checkbox("允許近四季虧損的公司", value=False, key="m_up")
+    skip_earn = c4.checkbox("財報在警示天數內者不新買進", value=False, key="m_skipearn",
+                            help="已持有的仍會續抱並標示；只是不再新買進財報在即的股票。")
+    st.text_area("上月持股（逗號或換行分隔，用來計算續抱／賣出）", key="m_prev")
+    with st.expander("持股備份（CSV）"):
+        st.file_uploader("匯入持股 CSV（欄位名稱 ticker / 代號 / symbol，或第一欄）", type="csv",
+                         key="m_upload", on_change=import_holdings)
+        st.download_button("匯出目前「上月持股」CSV",
+                           pd.DataFrame({"ticker": parse_tickers(st.session_state.get("m_prev", ""))}).to_csv(index=False).encode("utf-8-sig"),
+                           file_name="us_holdings.csv", key="dl_prev", mime="text/csv")
     st.caption("基本面抓取較慢（每檔約 1～2 秒，已用 4 條平行下載並快取 24 小時）。若出現抓取失敗，通常是 Yahoo 限流，稍後再試即可。")
 
     if st.button("開始多因子選股", type="primary", key="run_mf"):
         if w_mom + w_q + w_v + w_g == 0:
             st.error("四個權重不能全部為 0。")
         else:
-            prices = prepare_prices(uni, custom)
+            prices = prepare_prices(uni, custom, extra_list)
             p = SimpleNamespace(
                 min_price=min_price, min_dv=min_dv_m * 1e6, equity=equity, trend_filter=trend_filter,
                 allow_unprofitable=allow_unprof, w_mom=w_mom, w_quality=w_q, w_value=w_v, w_growth=w_g,
                 sector_neutral=sector_neutral, prefilter_top=prefilter / 100, max_fundamental=max_fund,
-                n_hold=n_hold, keep_rank=keep_rank, max_per_sector=max_sec, max_weight=max_w,
-                atr_mult=atr_mult_m, prev=parse_tickers(prev_text),
+                n_hold=n_hold, keep_rank=keep_rank, max_per_sector=max_sec, max_per_industry=max_ind,
+                max_weight=max_w, atr_mult=atr_mult_m, prev=parse_tickers(st.session_state.get("m_prev", "")),
+                extra=extra_list, warn_days=int(warn_days), skip_earnings=skip_earn,
             )
             bar = st.progress(0.0, text="準備抓取基本面…")
             try:
@@ -704,26 +985,31 @@ with tab_mf:
     if r:
         show_regime(r["regime"])
         show_funnel(r["funnel"])
-        pf_cols = ["name", "sector", "action", "rank", "composite", "mom", "quality", "value", "growth", "close",
-                   "weight_pct", "shares", "target_value", "stop", "stop_risk_pct", "r12_1", "r6", "near_high",
-                   "vol60", "fscore", "earn_yield", "fcf_yield", "roe", "last_date"]
+        pf_cols = ["name", "sector", "industry", "action", "earn_flag", "next_earnings", "rank", "composite",
+                   "mom", "quality", "value", "growth", "close", "weight_pct", "shares", "target_value", "stop",
+                   "stop_risk_pct", "r12_1", "r6", "near_high", "vol60", "fscore", "earn_yield", "fcf_yield",
+                   "roe", "last_date"]
         pct = ("r12_1", "r6", "vol60", "earn_yield", "fcf_yield", "roe")
         t_pf = fmt(r["pf"][[c for c in pf_cols if c in r["pf"].columns]], MF_MAP, pct_cols=pct)
         rk_cols = [c for c in pf_cols if c not in ("action", "weight_pct", "shares", "target_value", "stop", "stop_risk_pct")]
         t_rank = fmt(r["ranked"].head(100)[[c for c in rk_cols if c in r["ranked"].columns]], MF_MAP, pct_cols=pct)
         st.subheader("建議持股")
         st.dataframe(t_pf)
+        st.button("✅ 把本次建議持股設為「上月持股」", on_click=adopt_holdings, args=(list(r["pf"].index),),
+                  key="adopt_pf", help="下次執行時就會有續抱緩衝；同時寫入網址，加入書籤即可保存。")
         if not r["sells"].empty:
             st.subheader("賣出清單")
             st.dataframe(r["sells"])
+        show_diag(r.get("diag"))
         with st.expander("排名前 100"):
             st.dataframe(t_rank)
         sheets = {"建議持股": t_pf, "排名前100": t_rank}
         if not r["sells"].empty:
             sheets["賣出清單"] = r["sells"].set_index("代號")
+        if not r["diag"].empty:
+            sheets["自選股診斷"] = r["diag"].set_index("代號")
         st.download_button("下載 Excel", to_excel_bytes(sheets), file_name="us_multifactor_candidates.xlsx",
                            key="dl_mf", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.caption("提示：下單後，把「建議持股」的代號貼到「上月持股」欄，下個月才會有換手緩衝。")
         show_chart(r["charts"], "chart_mf")
 
 with st.expander("策略說明與限制"):
@@ -731,7 +1017,11 @@ with st.expander("策略說明與限制"):
         """
 - **趨勢突破**：大盤環境 → 股價與流動性 → Minervini 趨勢模板（股價在 150/200 日線上、均線多頭排列、200 日線走升、距 52 週高點 25% 內、高於 52 週低點 30%）→ RS 評分 → ATR 停損與依風險計算的股數。
 - **多因子**：動能（12-1 個月、6 個月、距 52 週高）、品質（ROE、毛利/總資產、F-Score、低負債）、價值（盈餘殖利率、預估盈餘殖利率、FCF 殖利率）、成長（營收與盈餘成長），以百分位排名加權；品質、價值、成長預設在同產業內比較。
+- **產業與細產業上限**：同產業最多 N 檔、同細產業最多 M 檔，避免押在同一個題材（例如三檔煉油股）。
+- **財報日**：來自 Yahoo，可能缺漏或只是預估日期；進場前請以公司公告為準。
+- **自選股**：左側「額外加入個股」會併入股票池；結果下方的「診斷」會說明每一檔為何入選或被排除。
+- **保存**：Streamlit 免費主機不會保存資料。請用「存到網址」加入書籤，或匯入/匯出 CSV。
 - **大盤曝險**：SPY 在 200 日線上且 50 日線 > 200 日線 → 100%；只在 200 日線上 → 60%；否則 30%。
-- **限制**：Yahoo 基本面不是歷史時點資料且偶有缺漏；本頁面不含回測（回測請用 Notebook 版本）；結果僅供研究，進場前請自行確認財報日、消息面與產業集中度。這不是投資建議。
+- **限制**：Yahoo 基本面不是歷史時點資料且偶有缺漏；本頁面不含回測（回測請用 Notebook 版本）；結果僅供研究，進場前請自行確認消息面與產業集中度。這不是投資建議。
 """
     )
