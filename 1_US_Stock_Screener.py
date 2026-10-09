@@ -2,9 +2,10 @@
 """
 美股選股（Streamlit 網頁版）
 
-兩個分頁：
+三個分頁：
   1. 趨勢突破掃描：大盤環境 → 流動性 → Minervini 趨勢模板 → RS 相對強度 → ATR 停損與建議股數（只用價格，速度快）
   2. 多因子選股：動能 + 品質 + 價值 + 成長綜合排名 → 換手緩衝 → 產業/細產業上限 → 反波動加權 → 大盤曝險
+  3. 預估上修選股：分析師 EPS 預估上修（財報預期動能）+ 價格動能 + 品質 → 產業上限 → ATR 停損與建議股數 → 大盤曝險
 
 功能：
   - 自行增加個股：併入股票池，並附「診斷」說明每檔為何入選或被排除
@@ -404,9 +405,102 @@ def get_fundamentals(tickers, progress=None, max_age_h=24, workers=4):
 
 
 # ============================================================
+# 分析師 EPS 預估上修（Yahoo 的 eps_trend / eps_revisions）
+# ============================================================
+REV_COLS = ["cy_est", "ny_est", "cy_rev30", "cy_rev90", "ny_rev30", "cy_up30", "cy_down30",
+            "rev_breadth", "n_analysts"]
+
+
+def _pct_change(cur, prev):
+    if cur is None or prev is None or prev == 0:
+        return None
+    return (cur - prev) / abs(prev)
+
+
+def _cell(df, row, col):
+    try:
+        v = df.loc[row, col]
+        return float(v) if pd.notna(v) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _find_col(df, *keys):
+    # Yahoo 的欄位大小寫不一致（例如 upLast30days / downLast7Days），用關鍵字找
+    if df is None or getattr(df, "empty", True):
+        return None
+    for c in df.columns:
+        name = str(c).lower().replace(" ", "")
+        if all(k in name for k in keys):
+            return c
+    return None
+
+
+def fetch_revisions(ticker):
+    t = yf.Ticker(ticker)
+
+    def safe(attr):
+        try:
+            return getattr(t, attr)
+        except Exception:  # noqa: BLE001
+            return None
+
+    tr, er, est = safe("eps_trend"), safe("eps_revisions"), safe("earnings_estimate")
+    out = {}
+    for row, tag in (("0y", "cy"), ("+1y", "ny")):
+        cur = _cell(tr, row, "current")
+        out[f"{tag}_est"] = cur
+        out[f"{tag}_rev30"] = _pct_change(cur, _cell(tr, row, "30daysAgo"))
+        if tag == "cy":
+            out["cy_rev90"] = _pct_change(cur, _cell(tr, row, "90daysAgo"))
+    up = _cell(er, "0y", _find_col(er, "up", "30"))
+    down = _cell(er, "0y", _find_col(er, "down", "30"))
+    out["cy_up30"], out["cy_down30"] = up, down
+    out["rev_breadth"] = (up - down) / (up + down) if up is not None and down is not None and up + down > 0 else None
+    out["n_analysts"] = _cell(est, "0y", "numberOfAnalysts")
+    return out
+
+
+@st.cache_resource
+def _rev_store():
+    return {}
+
+
+def get_revisions(tickers, progress=None, max_age_h=24, workers=4):
+    store = _rev_store()
+    now = time.time()
+    todo = [t for t in tickers if t not in store or now - store[t][0] > max_age_h * 3600]
+
+    def work(t):
+        try:
+            d = fetch_revisions(t)
+            return t, (d if d and any(v is not None for v in d.values()) else None)
+        except Exception:  # noqa: BLE001
+            return t, None
+
+    done = 0
+    if todo:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(work, t) for t in todo]
+            for f in as_completed(futs):
+                t, d = f.result()
+                if d is not None:
+                    store[t] = (time.time(), d)
+                done += 1
+                if progress is not None:
+                    progress.progress(done / len(todo), text=f"抓取分析師預估 {done}/{len(todo)}")
+    rows = {t: store[t][1] for t in tickers if t in store}
+    out = pd.DataFrame.from_dict(rows, orient="index") if rows else pd.DataFrame()
+    out = out.reindex(index=tickers, columns=REV_COLS)
+    for c in REV_COLS:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+
+# ============================================================
 # 因子評分與投組
 # ============================================================
-QUALITY = {"roe": 1, "gross_prof": 1, "fscore": 1, "debt_eq": -1}
+QUALITY ={"roe": 1, "gross_prof": 1, "fscore": 1, "debt_eq": -1}
 VALUE = {"earn_yield": 1, "fwd_ey": 1, "fcf_yield": 1}
 GROWTH = {"rev_g": 1, "eps_g": 1}
 
@@ -706,6 +800,105 @@ def run_multifactor(prices, p, progress=None):
             "charts": {t: prices[t]["Close"].iloc[-260:] for t in pf.index}}
 
 
+def run_revisions(prices, p, progress=None):
+    # 分析師預估上修 + 價格動能 + 品質：找「基本面預期正在變好、股價也確認」的股票
+    tech = build_tech(prices)
+    if tech.empty:
+        raise RuntimeError("沒有任何股票有足夠的價格資料。")
+    funnel = {"股票池（成功下載）": len([t for t in prices if t != BENCH]), "資料足夠(>=253日)": len(tech)}
+    liq1 = tech[(tech["close"] >= p.min_price) & (tech["dollar_vol"] >= p.min_dv)].copy()
+    funnel["通過股價與流動性"] = len(liq1)
+    liquid = liq1
+    if p.trend_filter:
+        liquid = liq1[liq1["close"] > liq1["sma200"]].copy()
+        funnel["收盤>200日線"] = len(liquid)
+    if liquid.empty:
+        raise RuntimeError("流動性與趨勢篩選後沒有任何股票（大盤可能很弱）。")
+
+    liquid["mom"] = momentum_score(liquid["r12_1"], liquid["r6"], liquid["near_high"])
+    cut = liquid["mom"].quantile(1 - p.prefilter_top)
+    pre = liquid[liquid["mom"] >= cut].sort_values("mom", ascending=False).head(p.max_fundamental)
+    funnel[f"動能前{int(p.prefilter_top * 100)}%（抓預估與基本面）"] = len(pre)
+    extra_in = [t for t in p.extra if t in liquid.index and t not in pre.index]
+    if extra_in:
+        pre = pd.concat([pre, liquid.loc[extra_in]])
+        funnel["自選股另外加入評分"] = len(extra_in)
+
+    rev = get_revisions(list(pre.index), progress=progress)
+    funnel["分析師預估取得成功"] = int(rev[["cy_rev30", "rev_breadth"]].notna().any(axis=1).sum())
+    fund = get_fundamentals(list(pre.index), progress=progress)
+    data = pre.join(rev).join(fund)
+    data["sector"] = data["sector"].fillna("Unknown")
+    data["industry"] = data["industry"].fillna("Unknown")
+    if not p.allow_unprofitable:
+        data = data[~(data["eps_ttm"].notna() & (data["eps_ttm"] <= 0))]
+        funnel["排除近四季虧損"] = len(data)
+    if p.require_up:
+        data = data[data["cy_rev30"].fillna(-1) > 0]
+        funnel["本年度 EPS 預估 30 日內上修"] = len(data)
+
+    rev_ranks = [data[c].rank(pct=True) for c in ("cy_rev30", "cy_rev90", "ny_rev30", "rev_breadth")
+                 if c in data.columns and data[c].notna().any()]
+    rev_score = (pd.concat(rev_ranks, axis=1).mean(axis=1, skipna=True) * 100) if rev_ranks \
+        else pd.Series(np.nan, index=data.index)
+    groups = data["sector"] if p.sector_neutral else None
+    S = pd.DataFrame({"rev_score": rev_score, "mom": data["mom"],
+                      "quality": group_score(data, QUALITY, groups)}, index=data.index)
+    W = pd.Series({"rev_score": p.w_rev, "mom": p.w_mom, "quality": p.w_quality})
+    avail = S.notna()
+    wsum = (avail * W).sum(axis=1)
+    comp = (S.fillna(0) * W).sum(axis=1) / wsum.replace(0, np.nan)
+    S["composite"] = comp.where(avail["rev_score"] & avail["mom"])
+    scored = data.drop(columns=["mom"]).join(S)
+
+    ranked = scored.dropna(subset=["composite"]).sort_values("composite", ascending=False).copy()
+    ranked["rank"] = range(1, len(ranked) + 1)
+    funnel["可評分（資料足夠）"] = len(ranked)
+    if ranked.empty:
+        raise RuntimeError("沒有任何股票可評分（預估資料可能抓取失敗或被 Yahoo 限流，請稍後再試）。")
+    ranked = add_earnings_cols(ranked, p.warn_days)
+
+    chosen, _, notes = build_portfolio(ranked, [], p)
+    pf = ranked.loc[chosen].copy()
+    reg = regime(prices[BENCH])
+    risk_pct = p.risk * reg["scale"]
+    pf["stop"] = pf["close"] - p.atr_mult * pf["atr"]
+    per_share = (pf["close"] - pf["stop"]).clip(lower=0.01)
+    by_risk = (p.equity * risk_pct / per_share).apply(math.floor)
+    by_cap = (p.equity * p.max_position / pf["close"]).apply(math.floor)
+    pf["shares"] = np.minimum(by_risk, by_cap).astype(int)
+    pf["position_value"] = pf["shares"] * pf["close"]
+
+    rank_pos = {t: i + 1 for i, t in enumerate(ranked.index)}
+    diag = []
+    for t in p.extra:
+        if t not in prices:
+            r = "❌ 查無價格資料（代號可能有誤，或 Yahoo 沒有這檔）"
+        elif t not in tech.index:
+            r = "❌ 價格資料不足（上市未滿約 1 年）"
+        elif t not in liq1.index:
+            r = f"❌ 股價或成交額不足（收盤 {tech.at[t, 'close']:.2f}、日均成交額 {tech.at[t, 'dollar_vol'] / 1e6:.1f}M）"
+        elif t not in liquid.index:
+            r = "❌ 收盤在 200 日線之下（可取消「只考慮收盤 > 200 日線」）"
+        elif t not in data.index:
+            r = "❌ 近四季虧損，或本年度 EPS 預估近 30 日沒有上修，已排除"
+        elif t not in rank_pos:
+            r = "❌ 預估資料不足，無法評分（Yahoo 可能沒有這檔的分析師預估）"
+        elif t in chosen:
+            r = f"✅ 入選（排名 {rank_pos[t]}）"
+        else:
+            r = f"➖ 排名第 {rank_pos[t]}，未入選（{notes.get(t, '名額已滿')}）"
+        row = {"代號": t, "結果": r}
+        if t in rank_pos:
+            rr = ranked.loc[t]
+            row.update({"綜合分": round(float(rr["composite"]), 1), "預估上修分": round(float(rr["rev_score"]), 1),
+                        "下次財報日": rr["next_earnings"], "財報提醒": rr["earn_flag"]})
+        diag.append(row)
+    diag_df = pd.DataFrame(diag) if diag else pd.DataFrame(columns=["代號", "結果"])
+    return {"pf": pf, "ranked": ranked, "regime": reg, "funnel": funnel, "diag": diag_df,
+            "charts": {t: prices[t]["Close"].iloc[-260:] for t in pf.index}}
+
+
 # ============================================================
 # 顯示與匯出
 # ============================================================
@@ -740,6 +933,17 @@ MF_MAP = {
     "stop_risk_pct": "停損風險占資金%", "r12_1": "12-1月報酬%", "r6": "6月報酬%", "dist_high": "距52週高%",
     "vol60": "年化波動%", "fscore": "F-Score(0-9)", "earn_yield": "盈餘殖利率%", "fcf_yield": "FCF殖利率%",
     "roe": "ROE%", "last_date": "資料日期",
+}
+
+
+REV_MAP = {
+    "name": "公司", "sector": "產業", "industry": "細產業", "earn_flag": "財報提醒", "next_earnings": "下次財報日",
+    "rank": "排名", "composite": "綜合分", "rev_score": "預估上修分", "mom": "動能分", "quality": "品質分",
+    "close": "收盤價", "cy_rev30": "本年度EPS預估30日變化%", "cy_rev90": "本年度EPS預估90日變化%",
+    "ny_rev30": "明年度EPS預估30日變化%", "rev_breadth": "上修−下修占比%(30日)",
+    "cy_up30": "30日上修家數", "cy_down30": "30日下修家數", "n_analysts": "分析師家數",
+    "stop": "建議停損價", "shares": "建議股數", "position_value": "部位金額", "r12_1": "12-1月報酬%",
+    "r6": "6月報酬%", "dist_high": "距52週高%", "fscore": "F-Score(0-9)", "roe": "ROE%", "last_date": "資料日期",
 }
 
 
@@ -884,7 +1088,7 @@ with st.sidebar:
     st.caption("首次執行會下載約 2 年日線，之後 6 小時內重跑會用快取。S&P 1500 較慢。")
 
 extra_list = parse_tickers(st.session_state.get("extra", ""))
-tab_trend, tab_mf = st.tabs(["🚀 趨勢突破掃描", "🧮 多因子選股（月度）"])
+tab_trend, tab_mf, tab_rev = st.tabs(["🚀 趨勢突破掃描", "🧮 多因子選股（月度）", "📊 預估上修選股"])
 
 # ---------------- 分頁 1：趨勢突破 ----------------
 with tab_trend:
@@ -1012,6 +1216,81 @@ with tab_mf:
                            key="dl_mf", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         show_chart(r["charts"], "chart_mf")
 
+# ---------------- 分頁 3：預估上修 ----------------
+with tab_rev:
+    st.markdown("找出**分析師盈餘預估正在上調、股價動能也確認**的股票（財報預期動能），再用品質分數擋掉體質差的公司。"
+                "預估資料來自 Yahoo，小型股常常沒有或家數很少，結果請當作研究線索。")
+    c1, c2, c3 = st.columns(3)
+    w_rev3 = c1.slider("預估上修權重 %", 0, 100, 50, key="r_wr")
+    w_mom3 = c2.slider("價格動能權重 %", 0, 100, 25, key="r_wm")
+    w_q3 = c3.slider("品質權重 %", 0, 100, 25, key="r_wq")
+    c1, c2, c3, c4 = st.columns(4)
+    n_hold3 = c1.slider("持股檔數", 5, 30, 12, key="r_n")
+    max_sec3 = c2.slider("同產業最多幾檔", 1, 10, 3, key="r_sec")
+    max_ind3 = c3.slider("同細產業最多幾檔", 1, 5, 2, key="r_ind")
+    max_fund3 = c4.slider("最多抓幾檔預估與基本面", 20, 250, 80, key="r_fund")
+    c1, c2, c3, c4 = st.columns(4)
+    prefilter3 = c1.slider("動能前幾 % 才抓預估", 20, 100, 50, key="r_pre")
+    atr_mult3 = c2.number_input("停損 = 收盤 − N × ATR", 1.0, 6.0, 2.5, 0.5, key="r_atr")
+    risk3 = c3.number_input("單筆風險占總資金 %", 0.1, 5.0, 1.0, 0.1, key="r_risk") / 100
+    max_pos3 = c4.number_input("單檔部位上限 %", 5.0, 100.0, 15.0, 5.0, key="r_maxpos") / 100
+    c1, c2, c3, c4 = st.columns(4)
+    sn3 = c1.checkbox("品質在同產業內比較", value=True, key="r_sn")
+    tf3 = c2.checkbox("只考慮收盤 > 200 日線", value=True, key="r_tf")
+    up3 = c3.checkbox("允許近四季虧損的公司", value=False, key="r_up")
+    req3 = c4.checkbox("只留本年度 EPS 預估 30 日內上修者", value=True, key="r_req",
+                       help="預估沒有上調的股票，即使動能強也不會入選。")
+    skip3 = st.checkbox("財報在警示天數內者不買進", value=False, key="r_skip")
+    st.caption("每檔需要額外查詢分析師預估與基本面，約 1～2 秒，已平行下載並快取 24 小時。Yahoo 限流時請稍後再試。")
+
+    if st.button("開始預估上修選股", type="primary", key="run_rev"):
+        if w_rev3 + w_mom3 + w_q3 == 0:
+            st.error("三個權重不能全部為 0。")
+        else:
+            prices = prepare_prices(uni, custom, extra_list)
+            p = SimpleNamespace(
+                min_price=min_price, min_dv=min_dv_m * 1e6, equity=equity, trend_filter=tf3,
+                allow_unprofitable=up3, require_up=req3, w_rev=w_rev3, w_mom=w_mom3, w_quality=w_q3,
+                sector_neutral=sn3, prefilter_top=prefilter3 / 100, max_fundamental=max_fund3,
+                n_hold=n_hold3, keep_rank=10_000, max_per_sector=max_sec3, max_per_industry=max_ind3,
+                atr_mult=atr_mult3, risk=risk3, max_position=max_pos3, prev=[], extra=extra_list,
+                warn_days=int(warn_days), skip_earnings=skip3,
+            )
+            bar = st.progress(0.0, text="準備抓取分析師預估…")
+            try:
+                st.session_state["res_rev"] = run_revisions(prices, p, progress=bar)
+            except RuntimeError as e:
+                st.session_state.pop("res_rev", None)
+                st.error(str(e))
+            bar.empty()
+
+    r = st.session_state.get("res_rev")
+    if r:
+        show_regime(r["regime"])
+        show_funnel(r["funnel"])
+        rev_cols = ["name", "sector", "industry", "earn_flag", "next_earnings", "rank", "composite", "rev_score",
+                    "mom", "quality", "close", "cy_rev30", "cy_rev90", "ny_rev30", "rev_breadth", "cy_up30",
+                    "cy_down30", "n_analysts", "stop", "shares", "position_value", "r12_1", "r6", "near_high",
+                    "fscore", "roe", "last_date"]
+        pct3 = ("cy_rev30", "cy_rev90", "ny_rev30", "rev_breadth", "r12_1", "r6", "roe")
+        t_pf3 = fmt(r["pf"][[c for c in rev_cols if c in r["pf"].columns]], REV_MAP, pct_cols=pct3)
+        rk3 = [c for c in rev_cols if c not in ("stop", "shares", "position_value")]
+        t_rank3 = fmt(r["ranked"].head(100)[[c for c in rk3 if c in r["ranked"].columns]], REV_MAP, pct_cols=pct3)
+        st.subheader("入選名單")
+        if t_pf3.empty:
+            st.info("目前沒有符合條件的股票。可以放寬條件（例如取消「只留預估上修者」）。")
+        else:
+            st.dataframe(t_pf3)
+        show_diag(r.get("diag"))
+        with st.expander("排名前 100"):
+            st.dataframe(t_rank3)
+        sheets3 = {"入選名單": t_pf3, "排名前100": t_rank3}
+        if not r["diag"].empty:
+            sheets3["自選股診斷"] = r["diag"].set_index("代號")
+        st.download_button("下載 Excel", to_excel_bytes(sheets3), file_name="us_revisions_candidates.xlsx",
+                           key="dl_rev", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        show_chart(r["charts"], "chart_rev")
+
 with st.expander("策略說明與限制"):
     st.markdown(
         """
@@ -1021,6 +1300,7 @@ with st.expander("策略說明與限制"):
 - **財報日**：來自 Yahoo，可能缺漏或只是預估日期；進場前請以公司公告為準。
 - **自選股**：左側「額外加入個股」會併入股票池；結果下方的「診斷」會說明每一檔為何入選或被排除。
 - **保存**：Streamlit 免費主機不會保存資料。請用「存到網址」加入書籤，或匯入/匯出 CSV。
+- **預估上修**：用分析師對本年度、明年度 EPS 預估近 30/90 天的變化，以及 30 天內上修與下修的家數差，加上價格動能與品質分數綜合排名；入選後依 ATR 停損與單筆風險算股數，並套用大盤曝險。預估資料取自 Yahoo，小型股常缺漏或家數很少。
 - **大盤曝險**：SPY 在 200 日線上且 50 日線 > 200 日線 → 100%；只在 200 日線上 → 60%；否則 30%。
 - **限制**：Yahoo 基本面不是歷史時點資料且偶有缺漏；本頁面不含回測（回測請用 Notebook 版本）；結果僅供研究，進場前請自行確認消息面與產業集中度。這不是投資建議。
 """
