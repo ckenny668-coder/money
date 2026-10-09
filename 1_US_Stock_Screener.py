@@ -408,7 +408,7 @@ def get_fundamentals(tickers, progress=None, max_age_h=24, workers=4):
 # 分析師 EPS 預估上修（Yahoo 的 eps_trend / eps_revisions）
 # ============================================================
 REV_COLS = ["cy_est", "ny_est", "cy_rev30", "cy_rev90", "ny_rev30", "cy_up30", "cy_down30",
-            "rev_breadth", "n_analysts"]
+            "rev_breadth", "n_analysts", "surprise_avg"]
 
 
 def _pct_change(cur, prev):
@@ -458,7 +458,48 @@ def fetch_revisions(ticker):
     out["cy_up30"], out["cy_down30"] = up, down
     out["rev_breadth"] = (up - down) / (up + down) if up is not None and down is not None and up + down > 0 else None
     out["n_analysts"] = _cell(est, "0y", "numberOfAnalysts")
+
+    # 近 4 季 EPS 驚喜（實際 vs 預估）：第二個獨立訊號，預估上修資料缺漏時也能提供佐證
+    out["surprise_avg"] = None
+    try:
+        hist = safe("earnings_history")
+        col = _find_col(hist, "surprise")
+        if col is not None:
+            s = pd.to_numeric(hist[col], errors="coerce").dropna()
+            if len(s):
+                out["surprise_avg"] = float(s.tail(4).mean())
+    except Exception:  # noqa: BLE001
+        pass
     return out
+
+
+def diagnose_revisions(tickers=("AAPL", "MSFT", "NVDA")):
+    # 資料自檢：直接問 Yahoo 幾檔大型股，列出各資料表的欄位與解析結果，
+    # 用來確認 Yahoo 格式沒變、也沒有被限流（大型股通常資料最完整）
+    rows = []
+    for tk in tickers:
+        row = {"代號": tk}
+        try:
+            t = yf.Ticker(tk)
+        except Exception as e:  # noqa: BLE001
+            row["狀態"] = f"❌ 無法連線：{type(e).__name__}"
+            rows.append(row)
+            continue
+        for attr in ("eps_trend", "eps_revisions", "earnings_estimate", "earnings_history"):
+            try:
+                df = getattr(t, attr)
+                row[attr] = ("✅ " + ", ".join(map(str, df.columns))) if df is not None and not df.empty else "⚠ 空"
+            except Exception as e:  # noqa: BLE001
+                row[attr] = f"❌ {type(e).__name__}"
+        try:
+            parsed = fetch_revisions(tk)
+            ok = sum(v is not None and not (isinstance(v, float) and math.isnan(v)) for v in parsed.values())
+            row["解析成功欄位數"] = f"{ok}/{len(REV_COLS)}"
+            row["狀態"] = "✅ 正常" if ok >= 6 else "⚠ 欄位偏少，Yahoo 格式可能改了或被限流"
+        except Exception as e:  # noqa: BLE001
+            row["狀態"] = f"❌ 解析失敗：{type(e).__name__}"
+        rows.append(row)
+    return rows
 
 
 @st.cache_resource
@@ -474,6 +515,9 @@ def get_revisions(tickers, progress=None, max_age_h=24, workers=4):
     def work(t):
         try:
             d = fetch_revisions(t)
+            if not d or all(v is None for v in d.values()):
+                time.sleep(1.0)  # Yahoo 偶爾暫時限流，隔一秒再試一次
+                d = fetch_revisions(t)
             return t, (d if d and any(v is not None for v in d.values()) else None)
         except Exception:  # noqa: BLE001
             return t, None
@@ -830,6 +874,17 @@ def run_revisions(prices, p, progress=None):
     data = pre.join(rev).join(fund)
     data["sector"] = data["sector"].fillna("Unknown")
     data["industry"] = data["industry"].fillna("Unknown")
+
+    # 資料品質關卡：Yahoo 的預估資料對小型股常常缺漏，缺資料不能當成「中性」排進名單
+    sig_cols = [c for c in ("cy_rev30", "cy_rev90", "ny_rev30", "rev_breadth", "surprise_avg") if c in data.columns]
+    data["rev_signals"] = data[sig_cols].notna().sum(axis=1)
+    data["data_quality"] = np.where(data["rev_signals"] >= 4, "完整", np.where(data["rev_signals"] >= 2, "部分", "不足"))
+    if p.min_analysts > 0:
+        data = data[data["n_analysts"].fillna(0) >= p.min_analysts]
+        funnel[f"分析師家數>={p.min_analysts}"] = len(data)
+    data = data[data["rev_signals"] >= 2]
+    funnel["預估訊號>=2項（資料品質足夠）"] = len(data)
+
     if not p.allow_unprofitable:
         data = data[~(data["eps_ttm"].notna() & (data["eps_ttm"] <= 0))]
         funnel["排除近四季虧損"] = len(data)
@@ -837,7 +892,7 @@ def run_revisions(prices, p, progress=None):
         data = data[data["cy_rev30"].fillna(-1) > 0]
         funnel["本年度 EPS 預估 30 日內上修"] = len(data)
 
-    rev_ranks = [data[c].rank(pct=True) for c in ("cy_rev30", "cy_rev90", "ny_rev30", "rev_breadth")
+    rev_ranks = [data[c].rank(pct=True) for c in ("cy_rev30", "cy_rev90", "ny_rev30", "rev_breadth", "surprise_avg")
                  if c in data.columns and data[c].notna().any()]
     rev_score = (pd.concat(rev_ranks, axis=1).mean(axis=1, skipna=True) * 100) if rev_ranks \
         else pd.Series(np.nan, index=data.index)
@@ -881,7 +936,7 @@ def run_revisions(prices, p, progress=None):
         elif t not in liquid.index:
             r = "❌ 收盤在 200 日線之下（可取消「只考慮收盤 > 200 日線」）"
         elif t not in data.index:
-            r = "❌ 近四季虧損，或本年度 EPS 預估近 30 日沒有上修，已排除"
+            r = "❌ 已排除：分析師家數不足、預估資料訊號少於 2 項、近四季虧損，或本年度 EPS 預估近 30 日沒有上修"
         elif t not in rank_pos:
             r = "❌ 預估資料不足，無法評分（Yahoo 可能沒有這檔的分析師預估）"
         elif t in chosen:
@@ -942,6 +997,7 @@ REV_MAP = {
     "close": "收盤價", "cy_rev30": "本年度EPS預估30日變化%", "cy_rev90": "本年度EPS預估90日變化%",
     "ny_rev30": "明年度EPS預估30日變化%", "rev_breadth": "上修−下修占比%(30日)",
     "cy_up30": "30日上修家數", "cy_down30": "30日下修家數", "n_analysts": "分析師家數",
+    "data_quality": "預估資料品質", "surprise_avg": "近4季EPS驚喜(Yahoo原值)",
     "stop": "建議停損價", "shares": "建議股數", "position_value": "部位金額", "r12_1": "12-1月報酬%",
     "r6": "6月報酬%", "dist_high": "距52週高%", "fscore": "F-Score(0-9)", "roe": "ROE%", "last_date": "資料日期",
 }
@@ -1240,8 +1296,17 @@ with tab_rev:
     up3 = c3.checkbox("允許近四季虧損的公司", value=False, key="r_up")
     req3 = c4.checkbox("只留本年度 EPS 預估 30 日內上修者", value=True, key="r_req",
                        help="預估沒有上調的股票，即使動能強也不會入選。")
-    skip3 = st.checkbox("財報在警示天數內者不買進", value=False, key="r_skip")
+    c1, c2 = st.columns(2)
+    min_analysts3 = c1.slider("最少分析師家數", 0, 15, 3, key="r_minan",
+                              help="Yahoo 對小型股的預估常只有 1～2 位分析師，變動很大；低於這個家數的股票不評分。設 0 代表不限制。")
+    skip3 = c2.checkbox("財報在警示天數內者不買進", value=False, key="r_skip")
     st.caption("每檔需要額外查詢分析師預估與基本面，約 1～2 秒，已平行下載並快取 24 小時。Yahoo 限流時請稍後再試。")
+    with st.expander("🔍 資料自檢（確認 Yahoo 預估資料格式正常）"):
+        st.caption("對 AAPL、MSFT、NVDA 各查一次，列出 Yahoo 回傳的資料表欄位與解析結果。"
+                   "如果這裡顯示異常，下面的選股結果就不可靠。")
+        if st.button("執行自檢", key="diag_rev"):
+            with st.spinner("檢查中…"):
+                st.dataframe(pd.DataFrame(diagnose_revisions()).set_index("代號"))
 
     if st.button("開始預估上修選股", type="primary", key="run_rev"):
         if w_rev3 + w_mom3 + w_q3 == 0:
@@ -1250,7 +1315,8 @@ with tab_rev:
             prices = prepare_prices(uni, custom, extra_list)
             p = SimpleNamespace(
                 min_price=min_price, min_dv=min_dv_m * 1e6, equity=equity, trend_filter=tf3,
-                allow_unprofitable=up3, require_up=req3, w_rev=w_rev3, w_mom=w_mom3, w_quality=w_q3,
+                allow_unprofitable=up3, require_up=req3, min_analysts=min_analysts3,
+                w_rev=w_rev3, w_mom=w_mom3, w_quality=w_q3,
                 sector_neutral=sn3, prefilter_top=prefilter3 / 100, max_fundamental=max_fund3,
                 n_hold=n_hold3, keep_rank=10_000, max_per_sector=max_sec3, max_per_industry=max_ind3,
                 atr_mult=atr_mult3, risk=risk3, max_position=max_pos3, prev=[], extra=extra_list,
@@ -1270,12 +1336,16 @@ with tab_rev:
         show_funnel(r["funnel"])
         rev_cols = ["name", "sector", "industry", "earn_flag", "next_earnings", "rank", "composite", "rev_score",
                     "mom", "quality", "close", "cy_rev30", "cy_rev90", "ny_rev30", "rev_breadth", "cy_up30",
-                    "cy_down30", "n_analysts", "stop", "shares", "position_value", "r12_1", "r6", "near_high",
-                    "fscore", "roe", "last_date"]
+                    "cy_down30", "n_analysts", "data_quality", "surprise_avg", "stop", "shares", "position_value",
+                    "r12_1", "r6", "near_high", "fscore", "roe", "last_date"]
         pct3 = ("cy_rev30", "cy_rev90", "ny_rev30", "rev_breadth", "r12_1", "r6", "roe")
         t_pf3 = fmt(r["pf"][[c for c in rev_cols if c in r["pf"].columns]], REV_MAP, pct_cols=pct3)
         rk3 = [c for c in rev_cols if c not in ("stop", "shares", "position_value")]
         t_rank3 = fmt(r["ranked"].head(100)[[c for c in rk3 if c in r["ranked"].columns]], REV_MAP, pct_cols=pct3)
+        if "data_quality" in r["ranked"].columns:
+            dq = r["ranked"]["data_quality"].value_counts()
+            st.caption("可評分股票的預估資料品質：" + "、".join(f"{k} {int(v)} 檔" for k, v in dq.items())
+                       + "。「部分」代表只有 2～3 項預估訊號，排名參考性較低。")
         st.subheader("入選名單")
         if t_pf3.empty:
             st.info("目前沒有符合條件的股票。可以放寬條件（例如取消「只留預估上修者」）。")
@@ -1300,7 +1370,7 @@ with st.expander("策略說明與限制"):
 - **財報日**：來自 Yahoo，可能缺漏或只是預估日期；進場前請以公司公告為準。
 - **自選股**：左側「額外加入個股」會併入股票池；結果下方的「診斷」會說明每一檔為何入選或被排除。
 - **保存**：Streamlit 免費主機不會保存資料。請用「存到網址」加入書籤，或匯入/匯出 CSV。
-- **預估上修**：用分析師對本年度、明年度 EPS 預估近 30/90 天的變化，以及 30 天內上修與下修的家數差，加上價格動能與品質分數綜合排名；入選後依 ATR 停損與單筆風險算股數，並套用大盤曝險。預估資料取自 Yahoo，小型股常缺漏或家數很少。
+- **預估上修**：用分析師對本年度、明年度 EPS 預估近 30/90 天的變化，以及 30 天內上修與下修的家數差，加上價格動能與品質分數綜合排名；入選後依 ATR 停損與單筆風險算股數，並套用大盤曝險。預估資料取自 Yahoo，小型股常缺漏或家數很少，所以有三道把關：分析師家數下限、至少 2 項預估訊號才評分、結果表標示「預估資料品質」；另加入近 4 季 EPS 驚喜當第二個佐證訊號。
 - **大盤曝險**：SPY 在 200 日線上且 50 日線 > 200 日線 → 100%；只在 200 日線上 → 60%；否則 30%。
 - **限制**：Yahoo 基本面不是歷史時點資料且偶有缺漏；本頁面不含回測（回測請用 Notebook 版本）；結果僅供研究，進場前請自行確認消息面與產業集中度。這不是投資建議。
 """
