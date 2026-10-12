@@ -1,0 +1,23 @@
+name: daily-screener
+on:
+  schedule:
+    - cron: "30 21 * * 1-5"   # 週一到週五 UTC 21:30，美股收盤後
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install yfinance pandas numpy lxml requests
+      - run: python screener.py --universe sp1500 --out data/
+      - name: Commit data
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/
+          git commit -m "update data" || echo "no changes"
+          git push
