@@ -154,3 +154,10 @@ def test_stale_ticker_without_last_bar_is_excluded():
     d.iloc[-1] = np.nan                                  # 最後一天沒資料(停牌/下市)
     res = scan(universe(STALE=d))
     assert not res.loc["STALE", "passed"]
+
+
+def test_near_miss_names_the_single_failed_condition():
+    res = scan(universe(BAD=ideal(pivot2=32.6), IDEAL=ideal()))
+    assert res.loc["IDEAL", "passed"] and not res.loc["IDEAL", "near_miss"]
+    r = res.loc["BAD"]
+    assert r["near_miss"] and r["missing"] == "higher_low" and r["miss_n"] == 1

@@ -212,6 +212,12 @@ def scan(prices: Prices, as_of=None, params: Params | None = None,
     out = out.join(pd.DataFrame.from_dict(feats, orient="index"))
 
     out["passed"] = out["liquid"] & out["strong"] & out["consolidating"]
+    # 差一項：流動性、強勢都過，整理型態六項只差一項(列出差哪一項，供人工看圖)
+    cons = ["depth_ok", "higher_low", "contraction", "above_emas", "ema_rising", "weekly_ok"]
+    flags = out[cons].astype(bool)
+    out["miss_n"] = len(cons) - flags.sum(axis=1)
+    out["missing"] = flags.apply(lambda r: ",".join(c for c in cons if not r[c]), axis=1)
+    out["near_miss"] = out["liquid"] & out["strong"] & (out["miss_n"] == 1)
     if info is not None:
         out = out.join(info, how="left")
     out.index.name = "ticker"
@@ -287,24 +293,52 @@ def download_prices(tickers: list[str], period: str = "2y",
                   merge("Volume").reindex(columns=cols))
 
 
+def funnel(res: pd.DataFrame) -> pd.DataFrame:
+    """逐層過濾的剩餘檔數，用來看是哪個條件把名單擋空。"""
+    steps = [("股票池", None), ("流動性", "liquid"), ("強勢(漲幅+排名)", "strong"),
+             ("回檔10~25%且已整理", "depth_ok"), ("回調低點墊高", "higher_low"),
+             ("波動收斂", "contraction"), ("站上9/21 EMA", "above_emas"),
+             ("EMA走平或向上", "ema_rising"), ("週線在10週線上", "weekly_ok")]
+    mask = pd.Series(True, index=res.index)
+    rows = []
+    for name, col in steps:
+        if col:
+            mask &= res[col].astype(bool)
+        rows.append((name, int(mask.sum())))
+    return pd.DataFrame(rows, columns=["條件(累積)", "剩餘檔數"])
+
+
 def main():
     ap = argparse.ArgumentParser(description="強勢股 + 整理轉強掃描")
     ap.add_argument("--period", default="2y")
     ap.add_argument("--as-of", default=None, help="YYYY-MM-DD，預設最新一天")
     ap.add_argument("--out", default="watchlist.csv")
+    ap.add_argument("--atr-max", type=float, default=None, help="波動收斂門檻，預設 0.8")
+    ap.add_argument("--max-depth", type=float, default=None, help="回檔上限，預設 0.25")
     ap.add_argument("--all", action="store_true", help="輸出全部欄位與全部股票，不只通過者")
     a = ap.parse_args()
 
     uni = load_sp1500()
     print(f"股票池 {len(uni)} 檔，下載價格中…")
     prices = download_prices(list(uni.index), a.period)
-    res = scan(prices, as_of=a.as_of, info=uni[["sector", "industry"]])
-    show = res if a.all else res[res["passed"]]
+    p = Params()
+    if a.atr_max is not None:
+        p = replace(p, atr_ratio_max=a.atr_max)
+    if a.max_depth is not None:
+        p = replace(p, max_depth=a.max_depth)
+    res = scan(prices, as_of=a.as_of, params=p, info=uni[["sector", "industry"]])
+    print(funnel(res).to_string(index=False))
+    show = res if a.all else res[res["passed"] | res["near_miss"]]
     show.to_csv(a.out, encoding="utf-8-sig")
     asof = prices.upto(a.as_of).close.index[-1].date()
-    print(f"資料截至 {asof}，通過 {int(res['passed'].sum())} 檔 → {a.out}")
-    print(show.head(30)[["close", "ret_63", "ret_126", "avg_pct", "depth",
-                         "atr_ratio", "sector", "industry"]].round(3).to_string())
+    print(f"資料截至 {asof}，全部通過 {int(res['passed'].sum())} 檔、"
+          f"差一項 {int(res['near_miss'].sum())} 檔 → {a.out}")
+    cols = ["close", "ret_63", "ret_126", "avg_pct", "depth", "atr_ratio",
+            "missing", "sector", "industry"]
+    print("\n[全部通過]")
+    print(res[res["passed"]][cols].round(3).to_string())
+    print("\n[差一項，missing 欄是沒過的那項，請人工看圖判斷]")
+    print(res[res["near_miss"]].head(40)[cols].round(3).to_string())
 
 
 if __name__ == "__main__":
