@@ -1,7 +1,6 @@
-streamlit>=1.35
-yfinance>=0.2.54
+streamlit
+yfinance
 pandas
 numpy
-openpyxl
 lxml
 requests
