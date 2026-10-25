@@ -1,5 +1,5 @@
 """網頁版：強勢股 + 整理轉強掃描（Streamlit）
-部署時 Main file path 請設為 streamlit_app.py，並與 momentum_scanner.py、requirements.txt 放在同一層。"""
+美股專用。部署時 Main file path 請設為 streamlit_app.py，並與 momentum_scanner.py、requirements.txt 放在同一層。"""
 import traceback
 from dataclasses import replace
 
@@ -7,17 +7,16 @@ import pandas as pd
 import streamlit as st
 
 import momentum_scanner as ms
-import tw_scanner as tw
 
-st.set_page_config(page_title="強勢整理掃描", layout="wide")
-st.title("強勢股 + 整理轉強掃描")
-st.caption("美股 S&P 1500／台股上市櫃 · 流程：強勢排名 → 流動性 → 上漲後整理(低點墊高、波動收斂、站上 9/21 EMA、週線在 10 週線上)。"
+st.set_page_config(page_title="美股強勢整理掃描", layout="wide")
+st.title("美股強勢股 + 整理轉強掃描")
+st.caption("S&P 1500（大型＋中型＋小型股） · 流程：強勢排名 → 流動性 → 上漲後整理(低點墊高、波動收斂、站上 9/21 EMA、週線在 10 週線上)。"
            "只用價量資料，不推測誰在買。結果是縮小範圍的觀察名單，請再人工看圖。")
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def get_universe(market: str) -> pd.DataFrame:
-    return tw.load_tw_universe() if market == "tw" else ms.load_sp1500()
+def get_universe() -> pd.DataFrame:
+    return ms.load_sp1500()
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -27,10 +26,8 @@ def get_prices(tickers: tuple, period: str) -> ms.Prices:
 
 # ---------------- 側邊欄參數 ----------------
 with st.sidebar:
-    market_label = st.radio("市場", ["美股 S&P 1500", "台股 上市櫃"])
-    market = "tw" if market_label.startswith("台") else "us"
-    cur = "新台幣" if market == "tw" else "美元"
-    d = tw.TW_PARAMS if market == "tw" else ms.Params()
+    cur = "美元"
+    d = ms.Params()
     st.header("參數")
     atr_max = st.slider("波動收斂：ATR(10)/ATR(30) 小於", 0.5, 1.3, d.atr_ratio_max, 0.05)
     depth_lo, depth_hi = st.slider("高點後回檔幅度", 0.0, 0.5, (d.min_depth, d.max_depth), 0.01)
@@ -63,7 +60,7 @@ if not st.session_state.get("loaded"):
 
 try:
     with st.spinner("取得股票池與價格中…（約 1～3 分鐘）"):
-        uni = get_universe(market)
+        uni = get_universe()
         prices = get_prices(tuple(uni.index), "2y")
     info_cols = [c for c in ("name", "sector", "industry") if c in uni.columns]
     res = ms.scan(prices, params=params, info=uni[info_cols])
@@ -114,8 +111,7 @@ with t5:
     st.caption(f"共 {len(rank)} 檔。依整理分數、趨勢模板條數、強勢百分位排序；missing 欄是沒過的整理條件。")
     st.dataframe(rank[rcols].style.format(fmt), width='stretch')
 with t3:
-    st.caption("在『排名』名單中，同一板塊有 2 檔以上者（階段 2 的雛形）。"
-               + ("台股的板塊是證交所產業別；放 tw_themes.csv 可改成自訂題材。" if market == "tw" else ""))
+    st.caption("在『排名』名單中，同一細產業有 2 檔以上者（階段 2 的雛形）。")
     if cand.empty:
         st.write("沒有候選股。")
     else:
