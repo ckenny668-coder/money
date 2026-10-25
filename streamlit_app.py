@@ -91,9 +91,17 @@ fmt["close"] = "{:.2f}"
 
 passed = res[res["passed"]]
 near = res[res["near_miss"]]
-cand = res[res["passed"] | res["near_miss"]]
+rcols = (["name"] if "name" in res.columns else []) + [
+    "cons_score", "tt_count", "missing", "close", "ret_63", "ret_126", "avg_pct",
+    "depth", "off_high", "atr_ratio", "tt_missing", "sector", "industry"]
+min_score = st.slider("排名：整理條件（共 6 條）至少要過幾條", 3, 6, 4,
+                      help="流動性、強勢（及勾選時的趨勢模板）是硬條件；整理型態六條改看分數。"
+                           "6 = 全部通過，5 = 差一項，4 = 差兩項。")
+rank = res[res["candidate"] & (res["cons_score"] >= min_score)].sort_values(
+    ["cons_score", "tt_count", "avg_pct"], ascending=False)
+cand = rank
 
-t1, t2, t3, t4 = st.tabs(["全部通過", "差一項", "板塊共振", "看圖"])
+t1, t2, t5, t3, t4 = st.tabs(["全部通過", "差一項", "排名", "板塊共振", "看圖"])
 with t1:
     if passed.empty:
         st.warning("目前沒有股票通過全部條件，可看「差一項」或放寬左側參數。")
@@ -102,8 +110,11 @@ with t1:
 with t2:
     st.caption("missing 欄是唯一沒過的條件。")
     st.dataframe(near[cols].style.format(fmt), width='stretch')
+with t5:
+    st.caption(f"共 {len(rank)} 檔。依整理分數、趨勢模板條數、強勢百分位排序；missing 欄是沒過的整理條件。")
+    st.dataframe(rank[rcols].style.format(fmt), width='stretch')
 with t3:
-    st.caption("在『全部通過＋差一項』中，同一板塊有 2 檔以上者（階段 2 的雛形）。"
+    st.caption("在『排名』名單中，同一板塊有 2 檔以上者（階段 2 的雛形）。"
                + ("台股的板塊是證交所產業別；放 tw_themes.csv 可改成自訂題材。" if market == "tw" else ""))
     if cand.empty:
         st.write("沒有候選股。")

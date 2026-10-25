@@ -272,6 +272,9 @@ def scan(prices: Prices, as_of=None, params: Params | None = None,
     out["miss_n"] = len(cons) - flags.sum(axis=1)
     out["missing"] = flags.apply(lambda r: ",".join(c for c in cons if not r[c]), axis=1)
     out["near_miss"] = out["liquid"] & out["strong"] & (out["miss_n"] == 1) & gate
+    # 排名模式：流動性、強勢(與趨勢模板，若要求)為硬條件，整理型態六項改成分數(0~6)
+    out["cons_score"] = len(cons) - out["miss_n"]
+    out["candidate"] = out["liquid"] & out["strong"] & gate
     if info is not None:
         out = out.join(info, how="left")
     out.index.name = "ticker"
@@ -374,6 +377,8 @@ def run_cli(load_universe, base_params: Params, desc: str = "強勢股 + 整理�
     ap.add_argument("--max-depth", type=float, default=None,
                     help=f"回檔上限，預設 {base_params.max_depth}")
     ap.add_argument("--all", action="store_true", help="輸出全部欄位與全部股票，不只通過者")
+    ap.add_argument("--rank", type=int, default=None,
+                    help="排名模式：輸出流動性＋強勢者中，整理條件(共6條)至少過 N 條的股票，依分數排序")
     ap.add_argument("--tt", action="store_true", help="通過/差一項都必須同時符合 Minervini 趨勢模板")
     a = ap.parse_args()
 
@@ -390,7 +395,13 @@ def run_cli(load_universe, base_params: Params, desc: str = "強勢股 + 整理�
     info_cols = [c for c in ("name", "sector", "industry") if c in uni.columns]
     res = scan(prices, as_of=a.as_of, params=p, info=uni[info_cols])
     print(funnel(res, with_tt=p.require_trend_template).to_string(index=False))
-    show = res if a.all else res[res["passed"] | res["near_miss"]]
+    if a.all:
+        show = res
+    elif a.rank is not None:
+        show = res[res["candidate"] & (res["cons_score"] >= a.rank)].sort_values(
+            ["cons_score", "avg_pct"], ascending=False)
+    else:
+        show = res[res["passed"] | res["near_miss"]]
     show.to_csv(a.out, encoding="utf-8-sig")
     asof = prices.upto(a.as_of).close.index[-1].date()
     print(f"資料截至 {asof}，全部通過 {int(res['passed'].sum())} 檔、"
