@@ -61,6 +61,8 @@ class Params:
     tt_min_above_low: float = 0.30        # 距 52 週低點至少 +30%
     tt_max_below_high: float = 0.25       # 距 52 週高點不超過 25%
     tt_rs_min: float = 0.70               # RS 百分位至少 70
+    overheat_dist: float = 0.30           # 收盤高於 50 日均線此比例以上，標記「過熱」(只標記，不排除)
+    range_days: int = 20                  # 整理區間寬度的觀察天數
     require_trend_template: bool = False  # True：通過/差一項都必須同時符合趨勢模板
 
 
@@ -112,7 +114,8 @@ def consolidation_features(close: pd.Series, high: pd.Series, low: pd.Series,
                pivot_prev=np.nan, pivot_last=np.nan, atr_ratio=np.nan,
                vol_ratio=np.nan, depth_ok=False, higher_low=False,
                contraction=False, above_emas=False, ema_rising=False,
-               weekly_ok=False, consolidating=False)
+               weekly_ok=False, consolidating=False,
+               dist_sma50=np.nan, range_20=np.nan, overheated=False)
 
     need = max(p.high_lookback, p.atr_long, p.ema_slow * 3) + 1
     if len(close) < need:
@@ -158,6 +161,15 @@ def consolidation_features(close: pd.Series, high: pd.Series, low: pd.Series,
     if atr_l > 0:
         res["atr_ratio"] = tr[-p.atr_short:].mean() / atr_l
         res["contraction"] = bool(res["atr_ratio"] < p.atr_ratio_max)
+
+    # 過熱標記與整理區間寬度(只供參考與排序，不參與 passed)
+    if len(c) >= 50:
+        sma50 = c[-50:].mean()
+        res["dist_sma50"] = c[-1] / sma50 - 1
+        res["overheated"] = bool(res["dist_sma50"] > p.overheat_dist)
+    rd = p.range_days
+    if len(c) >= rd and c[-1] > 0:
+        res["range_20"] = (h[-rd:].max() - l[-rd:].min()) / c[-1]
 
     # 量能(僅供參考，不參與篩選)
     v = volume.to_numpy(float)
@@ -274,6 +286,9 @@ def scan(prices: Prices, as_of=None, params: Params | None = None,
     out["near_miss"] = out["liquid"] & out["strong"] & (out["miss_n"] == 1) & gate
     # 排名模式：流動性、強勢(與趨勢模板，若要求)為硬條件，整理型態六項改成分數(0~6)
     out["cons_score"] = len(cons) - out["miss_n"]
+    # 核心分數：不含波動收斂(0~5)。波動收斂改為加分項，只用來同分時排序
+    core = [c for c in cons if c != "contraction"]
+    out["core_score"] = flags[core].sum(axis=1)
     out["candidate"] = out["liquid"] & out["strong"] & gate
     if info is not None:
         out = out.join(info, how="left")
@@ -350,6 +365,14 @@ def download_prices(tickers: list[str], period: str = "2y",
                   merge("Volume").reindex(columns=cols))
 
 
+def rank_table(res: pd.DataFrame, min_core: int = 4) -> pd.DataFrame:
+    """排名模式：核心整理條件(5 條，不含波動收斂)至少過 min_core 條。
+    排序：核心分數 → 不過熱優先 → 有波動收斂優先 → 趨勢模板條數 → 強勢百分位。"""
+    t = res[res["candidate"] & (res["core_score"] >= min_core)].copy()
+    return t.sort_values(["core_score", "overheated", "contraction", "tt_count", "avg_pct"],
+                         ascending=[False, True, False, False, False])
+
+
 def funnel(res: pd.DataFrame, with_tt: bool = False) -> pd.DataFrame:
     """逐層過濾的剩餘檔數，用來看是哪個條件把名單擋空。"""
     steps = [("股票池", None), ("流動性", "liquid"), ("強勢(漲幅+排名)", "strong"),
@@ -398,8 +421,7 @@ def run_cli(load_universe, base_params: Params, desc: str = "強勢股 + 整理�
     if a.all:
         show = res
     elif a.rank is not None:
-        show = res[res["candidate"] & (res["cons_score"] >= a.rank)].sort_values(
-            ["cons_score", "avg_pct"], ascending=False)
+        show = rank_table(res, a.rank)
     else:
         show = res[res["passed"] | res["near_miss"]]
     show.to_csv(a.out, encoding="utf-8-sig")
